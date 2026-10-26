@@ -86,20 +86,21 @@ def infer_tolerance(swaps_df, failed_df, bins_df):
 
 if __name__ == "__main__":
 
+    from config import OUTPUT_DIR  # PATH-1: same folder the pipeline uses
     logger.info("Loading swaps, failed tx and bins")
 
-    swaps_df = pd.read_parquet("data/swaps.parquet")
-    failed_df = pd.read_parquet("data/failed_transactions.parquet")
-    bins_df = pd.read_parquet("data/bins.parquet")
+    swaps_df = pd.read_parquet(f"{OUTPUT_DIR}/swaps.parquet")
+    failed_df = pd.read_parquet(f"{OUTPUT_DIR}/failed_transactions.parquet")
+    bins_df = pd.read_parquet(f"{OUTPUT_DIR}/bins.parquet")
 
     logger.info("Inferring tolerance per bin")
 
     tolerance_df = infer_tolerance(swaps_df, failed_df, bins_df)
 
-    os.makedirs("data", exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    tolerance_df.to_parquet("data/tolerance_bins.parquet", index=False)
-    tolerance_df.to_csv("data/tolerance_bins.csv", index=False)
+    tolerance_df.to_parquet(f"{OUTPUT_DIR}/tolerance_bins.parquet", index=False)
+    tolerance_df.to_csv(f"{OUTPUT_DIR}/tolerance_bins.csv", index=False)
 
     logger.info("Tolerance inference completed")
     logger.info(f"Bins inferred: {len(tolerance_df)}")

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # ============================================================
-# VeltoraCore Solver with LP Fixed-Point Participation
+# VeltoraCore Solver: every LP participates, pro rata
 # (Price-sweep aware, market valuation at swept price)
 # ============================================================
 
 import json
+import math
 import sys
 import time
 from copy import deepcopy
@@ -41,9 +42,16 @@ def solve_execution_once(inst, fee, time_limit=None):
     if total_cap <= 0:
         return {"status": "INFEASIBLE", "reason": "no_lp_capital"}
 
-    # Balanced LP inventory at previous-bin price
-    y0 = total_cap / 2.0                  # USD
-    x0 = (total_cap / 2.0) / P0           # asset
+    # CARRY-1: if every LP carries its own inventory (x, y), use it (operational
+    # mode: real deposits cannot be rebalanced for free between bins). Otherwise
+    # fall back to the legacy per-bin 50/50 restrike at the previous price.
+    carried = all(("x" in lp and "y" in lp) for lp in lps)
+    if carried:
+        x0 = sum(float(lp["x"]) for lp in lps)
+        y0 = sum(float(lp["y"]) for lp in lps)
+    else:
+        y0 = total_cap / 2.0                  # USD
+        x0 = (total_cap / 2.0) / P0           # asset
 
     # --------------------------------------------------------
     # Solver
@@ -51,6 +59,9 @@ def solve_execution_once(inst, fee, time_limit=None):
     solver = pywraplp.Solver.CreateSolver("CBC")
     if solver is None:
         return {"status": "INFEASIBLE", "reason": "solver_init_failed"}
+
+    if time_limit:
+        solver.SetTimeLimit(int(float(time_limit) * 1000))  # TIMELIMIT-1 (seconds -> ms)
 
     w, dx, dy = [], [], []
 
@@ -69,14 +80,15 @@ def solve_execution_once(inst, fee, time_limit=None):
         # Enforce user price feasibility at swept price P
         # Buy (q>0): require P <= p_max
         # Sell (q<0): require P >= p_min
-        P_fee = P * (1 + fee)
+        P_buy  = P * (1 + fee)   # what a buyer pays per unit of x
+        P_sell = P * (1 - fee)   # what a seller receives per unit of x (SELL-GATE-1)
 
-        # Buy (q > 0): user pays P_user, must be ≤ p_max
-        if q > 0 and p_max is not None and P_fee > p_max:
+        # Buy (q > 0): user pays P_buy, must be ≤ p_max
+        if q > 0 and p_max is not None and P_buy > p_max:
             solver.Add(wi == 0)
 
-        # Sell (q < 0): user receives P_user, must be ≥ p_min
-        if q < 0 and p_min is not None and P_fee < p_min:
+        # Sell (q < 0): user receives P_sell, must be ≥ p_min
+        if q < 0 and p_min is not None and P_sell < p_min:
             solver.Add(wi == 0)
 
         if q > 0:
@@ -157,8 +169,19 @@ def solve_execution_once(inst, fee, time_limit=None):
     #   user USD value + (LP surplus USD normalized by fee)
     protocol_objective = user_value_usd + lp_surplus_volume
 
+    # CARRY-1: allocate the pool's post-trade inventory back to the LPs,
+    # per asset, proportionally to each LP's pre-trade holding of that asset.
+    # Multiplicative, so no LP can go negative; exact pro-rata when all LPs
+    # hold the same composition. Conservation: sum over LPs == (x1, y1).
+    lps_out = None
+    if carried:
+        fx = (x1 / x0) if x0 > 0 else 0.0
+        fy = (y1 / y0) if y0 > 0 else 0.0
+        lps_out = [dict(lp, x=float(lp["x"]) * fx, y=float(lp["y"]) * fy) for lp in lps]
+
     return {
         "status": "OPTIMAL",
+        "lps_out": lps_out,
         "total_users": len(users),
         "count_dropped_users": len([u for u in users if u not in kept_users]),
         "total_users_original_demand_usd": sum(abs(float(u.get("q", 0.0))) * P0 for u in users),
@@ -171,6 +194,9 @@ def solve_execution_once(inst, fee, time_limit=None):
         "lp_surplus_income": lp_surplus_usd,
         "lp_surplus_volume": lp_surplus_volume,
         "protocol_objective": protocol_objective,
+        # JCB-SIMPLE-1: provider revenue above the do-nothing position, both valued
+        # at the frozen previous-bin price P0 (same baseline for every candidate).
+        "lp_excess_p0": (y1 + x1 * P0) - (y0 + x0 * P0),
         "x0": x0,
         "x1": x1,
         "y0": y0,
@@ -184,77 +210,129 @@ def solve_execution_once(inst, fee, time_limit=None):
     }
 
 # ------------------------------------------------------------
-# Solver with LP fixed-point participation
+# One candidate = one solve, every LP in (LP-ALL-IN-1)
 # ------------------------------------------------------------
-def solve_with_lp_fixed_point(inst, fee, time_limit=None, opts=None):
-    t_fp_start = time.perf_counter()
-    if opts is None:
-        opts = {}
-
-    active_lps = deepcopy(inst.get("lps", []))
-    bin_seconds = float(opts.get("binSeconds", 0.0))
-    seconds_per_year = float(opts.get("secondsPerYear", 31536000))
-
-    # Guard: APR-based floors require positive bin length
-    if bin_seconds <= 0 and not opts.get("ignoreMin", False):
+def solve_candidate(inst, fee, time_limit=None, opts=None):
+    """Solve one (fee, price) candidate with every LP participating, pro rata.
+    An LP's floorAPR is reported, not enforced: `lps_below_floor` counts the LPs whose
+    pro-rata net return this bin is below their floor (needs opts.binSeconds > 0)."""
+    t0 = time.perf_counter()
+    opts = opts or {}
+    lps = deepcopy(inst.get("lps", []))
+    if lps and all(("x" in lp and "y" in lp) for lp in lps):
+        P0 = float(inst["p0"])                      # CARRY-1: capital = x*P0 + y
+        for lp in lps:
+            lp["capitalUSD"] = float(lp["x"]) * P0 + float(lp["y"])
+    if not lps:
         return None
 
-    while True:
-        if not active_lps:
-            return None
+    sol = solve_execution_once(dict(inst, lps=lps), fee, time_limit)
+    if sol is None or sol.get("status") != "OPTIMAL":   # CRASH-1
+        return None
 
-        inst_fp = deepcopy(inst)
-        inst_fp["lps"] = active_lps
+    total_cap = sum_capital(lps)
+    surplus = sol["lp_surplus_income"]
+    bin_seconds = float(opts.get("binSeconds", 0.0))
+    seconds_per_year = float(opts.get("secondsPerYear", 31536000))
+    below = None
+    if bin_seconds > 0 and total_cap > 0:
+        net_apr = (surplus / total_cap) * (seconds_per_year / bin_seconds)   # pro rata: the same for every LP
+        below = sum(1 for lp in lps if net_apr < float(lp.get("floorAPR", 0.0)))
 
-        sol = solve_execution_once(inst_fp, fee, time_limit)
-        if sol is None:
-            return None
-
-        total_cap = sum_capital(active_lps)
-        lp_surplus_income = sol["lp_surplus_income"]
-
-        worst_lp = None
-        worst_margin = float("inf")
-
-        for lp in active_lps:
-            C = float(lp.get("capitalUSD", 0.0))
-            if C <= 0:
-                continue
-
-            w = C / total_cap if total_cap > 0 else 0.0
-            net_i = w * lp_surplus_income
-
-            net_apr = (net_i / C) * (seconds_per_year / bin_seconds)
-            floor_apr = float(lp.get("floorAPR", 0.0))
-            margin = net_apr - floor_apr
-
-            if margin < worst_margin:
-                worst_margin = margin
-                worst_lp = lp
-
-        # Fixed-point condition: all LPs satisfy floors
-        if worst_margin >= 0 or opts.get("ignoreMin", False):
-            break
-
-        # Remove the LP that violates the constraint the most
-        active_lps = [lp for lp in active_lps if lp is not worst_lp]
-
-    sol["total_count_lps"] = len(inst.get("lps", []))
-    #sol["total_count_active_lps"] = len(active_lps)
-    sol["dropped_count_lps"] = len(inst.get("lps", [])) - len(active_lps)
+    sol["active_mask"] = [True] * len(lps)
+    sol["total_count_lps"] = len(lps)
+    sol["dropped_count_lps"] = 0
+    sol["lps_below_floor"] = below
     sol["total_cap_original_lps"] = sum_capital(inst.get("lps", []))
-    sol["total_cap_active_lps"] = sum_capital(active_lps)
-    #sol["dropped_volume_lps"] = [lp for lp in inst.get("lps", []) if lp not in active_lps]
-    sol["lp_net"] = lp_surplus_income/(sum_capital(active_lps)) if sum_capital(active_lps) > 0 else 0.0 
-    #* (seconds_per_year / bin_seconds)
-    
-    # return check (can be removed in production)
-    sol["return_check"] = sol["income_check"]/(sum_capital(active_lps)) if sum_capital(active_lps) > 0 else 0.0
-
-    # --- measure full fixed-point solve time
-    solve_time_ms = (time.perf_counter() - t_fp_start) * 1000.0
-    sol["solve_time_ms"] = solve_time_ms
+    sol["total_cap_active_lps"] = total_cap
+    sol["lp_net"] = surplus / total_cap if total_cap > 0 else 0.0
+    sol["return_check"] = sol["income_check"] / total_cap if total_cap > 0 else 0.0
+    sol["solve_time_ms"] = (time.perf_counter() - t0) * 1000.0
     return sol
+
+# ------------------------------------------------------------
+# JCB-SIMPLE-1: Joint Clearing Bargain winner selection
+# Videira (2026), "The Joint Clearing Bargain", SSRN 7107418, section 2.
+# ------------------------------------------------------------
+def jcb_q(p):
+    """Eq. (3): q = q*(p), the larger root of c q^2 - (c p + 2) q + p (1 - p) = 0,
+    with c = p^2 / (1 + p)."""
+    c = p * p / (1.0 + p)
+    D = (c * p + 2.0) ** 2 - 4.0 * c * p * (1.0 - p)
+    return ((c * p + 2.0) + math.sqrt(D)) / (2.0 * c)
+
+
+def jcb_score(x, y, p, q=None):
+    """Eq. (1): z = m^p * (1 - r^2)^q, m = (x + y)/2, r = (x - y)/(x + y), x, y in [0, 1]."""
+    if q is None:
+        q = jcb_q(p)
+    if x + y <= 0.0:
+        return 0.0
+    m = (x + y) / 2.0
+    r = (x - y) / (x + y)
+    return (m ** p) * (max(0.0, 1.0 - r * r) ** q)
+
+
+def jcb_select(cands, p):
+    """Pick the candidate with the highest JCB score. Per bin, each attainment is
+    mapped to [0, 1] by its worst and best value over the feasible candidates
+    (Kalai-Smorodinsky normalization): providers x = lp_excess_p0, users y =
+    kept_volume_P0 (executed flow at the frozen price). An attainment that is equal
+    for every candidate cannot discriminate and is set to 1. Ties: first in sweep order."""
+    if not cands:
+        return None
+    q = jcb_q(p)
+
+    def norm(vals):
+        lo, hi = min(vals), max(vals)
+        if hi - lo <= 1e-12 * max(1.0, abs(hi)):
+            return [1.0] * len(vals)
+        return [(v - lo) / (hi - lo) for v in vals]
+
+    xs = norm([float(s["lp_excess_p0"]) for s in cands])
+    ys = norm([float(s["kept_volume_P0"]) for s in cands])
+    best_i, best_z = 0, float("-inf")
+    for i, (x, y) in enumerate(zip(xs, ys)):
+        z = jcb_score(x, y, p, q)
+        if z > best_z:
+            best_i, best_z = i, z
+    best = cands[best_i]
+    best.update({"jcb_p": p, "jcb_q": q, "jcb_score": best_z,
+                 "jcb_x": xs[best_i], "jcb_y": ys[best_i], "jcb_candidates": len(cands)})
+    return best
+
+
+def sweep(inst, objective=None):
+    """Mode B: solve every (fee, price) candidate, return the winner (or None)."""
+    if objective is None:
+        from config import OBJECTIVE as objective
+    time_limit = inst.get("timeLimit", None)
+    opts       = inst.get("opts", {})
+    price_grid = inst.get("price_grid") or [inst.get("price")]
+    fee_grid   = inst.get("fee_grid") or [inst.get("fee", 0.0)]
+
+    cands = []
+    for fee in fee_grid:
+        for P in price_grid:
+            inst_try = deepcopy(inst)
+            inst_try["fee"] = fee
+            inst_try["price"] = P
+            sol = solve_candidate(inst_try, fee, time_limit, opts)
+            if sol is not None:
+                cands.append(sol)
+
+    if objective == "jcb":
+        from config import JCB_P_PRICE_ON, JCB_P_PRICE_OFF
+        p = JCB_P_PRICE_ON if len(set(price_grid)) > 1 else JCB_P_PRICE_OFF
+        return jcb_select(cands, p)
+
+    best_sol, best_obj = None, float("-inf")          # legacy: protocol_objective
+    for sol in cands:
+        obj = sol.get("protocol_objective", float("-inf"))
+        if obj > best_obj:
+            best_obj, best_sol = obj, sol
+    return best_sol
+
 
 def main():
     inst = json.load(sys.stdin)
@@ -270,7 +348,7 @@ def main():
     # --------------------------------------------------
     if not price_grid and not fee_grid:
         fee = float(inst.get("fee", 0.0))
-        sol = solve_with_lp_fixed_point(inst, fee, time_limit, opts)
+        sol = solve_candidate(inst, fee, time_limit, opts)
 
         if sol is None:
             print(json.dumps({"status": "INFEASIBLE"}))
@@ -282,26 +360,8 @@ def main():
     # --------------------------------------------------
     # Mode B: sweep (used by orchestrator)
     # --------------------------------------------------
-    best_sol = None
-    best_obj = float("-inf")
-
     t_sweep_start = time.perf_counter()
-
-    for fee in fee_grid:
-        for P in price_grid:
-            inst_try = deepcopy(inst)
-            inst_try["fee"] = fee
-            inst_try["price"] = P
-
-            sol = solve_with_lp_fixed_point(inst_try, fee, time_limit, opts)
-            if sol is None:
-                continue
-
-            obj = sol.get("protocol_objective", float("-inf"))
-            if obj > best_obj:
-                best_obj = obj
-                best_sol = sol
-
+    best_sol = sweep(inst)                            # JCB-SIMPLE-1 (config.OBJECTIVE)
     total_sweep_time_ms = (time.perf_counter() - t_sweep_start) * 1000.0
 
     if best_sol is None:

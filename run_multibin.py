@@ -29,6 +29,17 @@ def initial_reserves(total_cap_usd, P0):
     return x0, y0
 
 # --------------------------------------------------
+# CARRY-1 helpers: persistent per-LP inventory and mark-to-market value
+# --------------------------------------------------
+def seed_inventory(lps, P):
+    """Split each LP's USD capital 50/50 at price P, once, at the first bin."""
+    return [dict(lp, x=float(lp["capitalUSD"]) / 2.0 / P, y=float(lp["capitalUSD"]) / 2.0)
+            for lp in lps]
+
+def pool_value(lps, P):
+    return sum(float(lp["x"]) * P + float(lp["y"]) for lp in lps)
+
+# --------------------------------------------------
 # Exogenous Market Price Generator
 # --------------------------------------------------
 
@@ -140,11 +151,13 @@ def main():
             P_market=P_Market
             )
         
+            if CARRY_INVENTORY and bin_id == 0:
+                lps = seed_inventory([lp.__dict__ for lp in lps], P0_opt)   # CARRY-1
             inst = {
                 "bin_id": bin_id,
                 "p0": P0_opt,
                 "users": [u.__dict__ for u in users],
-                "lps": [lp.__dict__ for lp in lps],
+                "lps": lps if CARRY_INVENTORY else [lp.__dict__ for lp in lps],
                 "price_grid": price_grid,
                 "fee_grid": fee_grid,
                 "opts": {
@@ -208,6 +221,8 @@ def main():
             # --------------------------
             x_uni = sol_uni["x1"]
             y_uni = sol_uni["y1"]
+            if CARRY_INVENTORY and sol_opt.get("lps_out") is not None:
+                lps = sol_opt["lps_out"]                                   # CARRY-1
             
             #P0_opt = P_Market
             #P0_uni = P_Market
@@ -250,6 +265,10 @@ def main():
 
         skipped_bins = 0
         valid_compounded_bins = 0
+
+        carried_lps = None      # CARRY-1: one persistent LP set for the whole run
+        V_prev = None
+        cum_log_opt_mtm = 0.0
 
         # --------------------------------------------------
         # Historical bin loop
@@ -301,6 +320,12 @@ def main():
             # ---------------------------------
             inst["p0"] = P0_opt
 
+            if CARRY_INVENTORY:
+                if carried_lps is None:
+                    carried_lps = seed_inventory(inst["lps"], P0_opt)
+                    V_prev = pool_value(carried_lps, P0_opt)
+                inst["lps"] = carried_lps
+
             sol_opt = run_single_bin_veltoracore(inst)
 
             if sol_opt["status"] != "OPTIMAL":
@@ -312,6 +337,17 @@ def main():
                 break
 
             lp_return_bin = sol_opt["lp_net"]
+
+            # METRIC-1: mark-to-market LP return, same basis as uni_lp_return_raw
+            # (value at this bin's price vs value at the previous bin's price).
+            opt_return_mtm = None
+            if CARRY_INVENTORY and sol_opt.get("lps_out") is not None:
+                carried_lps = sol_opt["lps_out"]
+                V_now = pool_value(carried_lps, sol_opt["P"])
+                opt_return_mtm = V_now / V_prev - 1 if V_prev > 0 else 0.0
+                V_prev = V_now
+                if i > 0 and opt_return_mtm > -1:
+                    cum_log_opt_mtm += math.log(1 + opt_return_mtm)
 
             # ---------------------------------
             # Manual cumulative compounding
@@ -354,6 +390,10 @@ def main():
 
                 # Per-bin LP return
                 "opt_lp_return_bin": lp_return_bin,
+                "opt_lp_return_bin_mtm": opt_return_mtm,
+                "opt_log_cum_return_mtm": cum_log_opt_mtm,
+                "opt_x": sum(float(l["x"]) for l in carried_lps) if carried_lps else None,
+                "opt_y": sum(float(l["y"]) for l in carried_lps) if carried_lps else None,
                 "uni_lp_return_bin": uni_lp_return,
 
                 # Cumulative log returns

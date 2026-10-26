@@ -84,6 +84,18 @@ if PRICE_STOCHASTIC:
 
 OUTPUT_CSV = "summary.csv"
 
+# CARRY-1: carry each LP's inventory (x, y) from bin to bin (operational mode).
+# False reproduces the legacy per-bin 50/50 restrike at the previous price.
+CARRY_INVENTORY = True
+
+# JCB-SIMPLE-1: how the sweep picks the winning (price, fee).
+#   "jcb"    -> Joint Clearing Bargain score z = m^p * (1 - r^2)^q (Videira 2026,
+#               SSRN 7107418, eqs. 1 and 3), attainments normalized per bin.
+#   "legacy" -> the original protocol_objective (reproduces older results).
+OBJECTIVE = "jcb"
+JCB_P_PRICE_ON = 0.76    # price and fee both swept (preprint, section 4)
+JCB_P_PRICE_OFF = 0.60   # fee is the only instrument (single-price grid)
+
 ### Liquidity Drift Filter (Historical Mode)
 
 LIQ_DRIFT_THRESHOLD = 0.01
