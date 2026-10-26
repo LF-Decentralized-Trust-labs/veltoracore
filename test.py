@@ -1,5 +1,6 @@
 import pandas as pd
-tol = pd.read_csv("data/tolerance_bins.csv")
+from config import OUTPUT_DIR  # PATH-1
+tol = pd.read_csv(f"{OUTPUT_DIR}/tolerance_bins.csv")
 print(tol.columns)
 print(tol.head())
 

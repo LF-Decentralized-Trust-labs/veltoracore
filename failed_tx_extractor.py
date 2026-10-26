@@ -86,9 +86,9 @@ if __name__ == "__main__":
 
     df = extract_failed_transactions(w3, START_BLOCK, END_BLOCK)
 
-    os.makedirs("data", exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    df.to_parquet("data/failed_transactions.parquet", index=False)
-    df.to_csv("data/failed_transactions.csv", index=False)
+    df.to_parquet(f"{OUTPUT_DIR}/failed_transactions.parquet", index=False)
+    df.to_csv(f"{OUTPUT_DIR}/failed_transactions.csv", index=False)
 
     logger.info("Failed transaction extraction completed")

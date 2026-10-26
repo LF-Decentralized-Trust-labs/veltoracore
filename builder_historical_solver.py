@@ -27,10 +27,15 @@ def build_users_historical(swaps_bin, tolerance_value):
 
     for _, row in swaps_bin.iterrows():
 
-        q = row["eth_amount"]
+        q = row["eth_amount"]          # always >= 0 (extractor stores abs value)
         P_exec = row["price"]
 
-        if q > 0:
+        # DIRECTION-1: the side comes from `direction`, written from the POOL's
+        # point of view by swap_extractor ("buy" = the pool received ETH, i.e.
+        # the USER SOLD ETH). Branching on q > 0 turned every swap into a buy.
+        user_buys_eth = (row["direction"] == "sell")
+
+        if user_buys_eth:
             # user buying ETH
             users.append({
                 "q": abs(q),

@@ -1,1 +1,8 @@
 ortools>=9.7.2996
+pandas
+numpy
+pyarrow
+requests
+web3
+tqdm
+pytest

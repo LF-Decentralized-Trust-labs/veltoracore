@@ -74,22 +74,19 @@ Activate:
 
 Linux / macOS: source .venv/bin/activate
 
-Windows: .venv\Scripts\activate
+Windows (PowerShell): .venv\Scripts\Activate.ps1
 
 ------------------------------------------------------------------------
 
 ### 4. Install Dependencies
 
-If requirements.txt exists:
-
     pip install -r requirements.txt
 
-Otherwise:
+The solver is OR-Tools (CBC); no commercial solver is needed.
 
-    pip install pandas numpy pyarrow requests web3 tqdm
-    pip install gurobipy
+Check the install:
 
-The solver uses Gurobi, which needs a licence (free academic licences are available from Gurobi).
+    python -m pytest tests/ -q
 
 ------------------------------------------------------------------------
 
@@ -124,15 +121,26 @@ There are two main phases:
 
 #### Historical Block Configuration
 
-    START_BLOCK = 19000000
-    END_BLOCK = 19010000
-    BIN_SIZE_BLOCKS = 50
+    START_BLOCK = 19230000
+    END_BLOCK   = START_BLOCK + int((N_BINS*BIN_SECONDS)/ETHEREUM_BIN)
+    N_BINS      = int(7*24*60*60/BIN_SECONDS)   # 7 days
 
 -   START_BLOCK → first Ethereum block to analyze
--   END_BLOCK → last block
--   BIN_SIZE_BLOCKS → size of execution bins
+-   END_BLOCK → last block (derived from N_BINS and BIN_SECONDS)
+-   BIN_SECONDS / ETHEREUM_BIN → bin length (600 s = 50 blocks)
 
 Ethereum produces \~7200 blocks/day.
+
+------------------------------------------------------------------------
+
+#### LP Inventory
+
+    CARRY_INVENTORY = True
+
+-   True → one LP set per run, seeded 50/50 once; each LP's inventory
+    (x, y) carries from bin to bin
+-   False → legacy mode: inventory restruck 50/50 at the previous price
+    every bin (reproduces results produced before this option existed)
 
 ------------------------------------------------------------------------
 
@@ -238,6 +246,9 @@ Containing:
 
 -   Per-bin returns
 -   Cumulative returns
+-   Mark-to-market LP return (`opt_lp_return_bin_mtm`,
+    `opt_log_cum_return_mtm`) on the same basis as Uniswap's raw LP
+    return; `opt_x`, `opt_y` = pool inventory after the bin
 -   VeltoraCore vs Uniswap comparison
 -   Solver metrics
 
@@ -258,6 +269,8 @@ Containing:
 -   Abnormal liquidity bins are filtered
 -   Cumulative returns are recomputed locally
 -   Net LP inflows/outflows assumed second-order within bins
+-   Every LP takes part in every candidate solve, pro rata to its capital; an LP's `floorAPR`
+    is reported (`lps_below_floor`), not enforced
 
 ------------------------------------------------------------------------
 
